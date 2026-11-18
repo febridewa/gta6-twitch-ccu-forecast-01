@@ -18,7 +18,7 @@ Play along or enter your own forecast at
 ## Method
 
 The reference class is 38–42 past big game launches' hourly Twitch curves,
-shipped inside each case as `comparables`. Three estimators are fitted at run
+shipped inside each case as `comparables`. Four estimators are fitted at run
 time from those curves and blended by geometric mean:
 
 1. **DST-aligned log-log OLS on rolling-midnight launches.** Launches are
@@ -27,7 +27,9 @@ time from those curves and blended by geometric mean:
    hour depending on the date; GTA VI's US-East unlock is 05:00Z, so its
    first US hour is hour 6). Training set: launches whose hour-1 print is at
    least 8% of their day's peak, whose peak lands in the evening (hour ≥ 16),
-   and which had no early access.
+   and which had no early access. Weak-tier analogues (free-to-play,
+   slow-burn launches — Marvel Rivals) are left out of this component: their
+   flat, sustained shape is not a rolling launch's shape.
 2. **Plain per-hour log-log OLS on all usable comparables** — log viewers(h)
    on log viewers(1). This keeps the very biggest launches (Elden Ring,
    Cyberpunk 2077: simultaneous global unlocks, hour-1 prints near 900k) as
@@ -37,16 +39,22 @@ time from those curves and blended by geometric mean:
    100–1000× by evening) cannot drag its slope down.
 3. **Huber-robust per-hour log-log OLS** on the same rolling set as (1),
    down-weighting launches whose curve is an outlier for that hour.
+4. **Nearest-neighbour kernel on rolling launches.** Per hour, a Gaussian
+   kernel over log hour-1 prints (bandwidth 1.5 log units) weights the
+   rolling launches and the forecast quantiles are the kernel-weighted
+   quantiles of their log viewers. Local in scale, so a huge target borrows
+   only from the biggest launches and the shape can saturate instead of
+   following one global line.
 
 Each estimator's spread is the empirical quantiles of its own residuals,
-shrunk by 0.7. The target's log hour-1 print is winsorised to the training
+shrunk by 0.6. The target's log hour-1 print is winsorised to the training
 range, so a GTA-VI-sized print does not extrapolate the log-linear slope into
 nonsense (the biggest launches' evening ratios sit near 0.9–1.3× their hour-1
 print). Weights are 1 + 0.08 × (release year − 2018): recent launches count
-more. Blend weights: 0.5 / 0.25 / 0.25. Any hour an estimator cannot fit
-falls back to the other estimators, then to the house persistence shape, so
-the program always writes a valid file. Deterministic: pure arithmetic, no
-randomness, no network.
+more. Blend weights: 0.6 / 0.3 / 0.1 for the three OLS estimators, plus 0.15
+for the kernel. Any hour an estimator cannot fit falls back to the other
+estimators, then to the house persistence shape, so the program always writes
+a valid file. Deterministic: pure arithmetic, no randomness, no network.
 
 ## Validation (local, against the practice answers)
 
@@ -57,10 +65,10 @@ before submission:
 
 | check | result |
 |---|---|
-| Practice pinball loss (4 cases × 23 h × 5 levels) | **0.1554** (house baseline 0.3871) |
-| Per case | p00 0.202, p01 0.146, p02 0.104, p03 0.170 |
-| Leave-one-launch-out, GTA-VI-like launches (rolling, evening peak, no early access) | mean 0.335, median 0.223 (baseline 0.482 / 0.372) |
-| Leave-one-launch-out, big launches (hour-1 ≥ 50k) | mean 0.233, median 0.187 (baseline 0.252 / 0.247) |
+| Practice pinball loss (4 cases × 23 h × 5 levels) | **0.1435** (v1: 0.1554; house baseline 0.3871) |
+| Per case | p00 0.182, p01 0.149, p02 0.087, p03 0.156 |
+| Leave-one-launch-out, GTA-VI-like launches (rolling, evening peak, no early access) | mean 0.337, median 0.246 (v1: 0.335 / 0.223) |
+| Leave-one-launch-out, big launches (hour-1 ≥ 50k) | mean 0.241, median 0.168 (v1: 0.242 / 0.187 on the same harness) |
 | Output format | 23 rows, hours 2–24, quantiles non-decreasing, ≤ 65,536 bytes |
 | Determinism | two runs byte-identical |
 | Runtime | ~0.05 s per case (limit 8 s) |

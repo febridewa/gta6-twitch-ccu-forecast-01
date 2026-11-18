@@ -65,11 +65,20 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
 
-SPREAD_MULT = 0.7          # shrinkage applied to empirical residual quantiles
-BLEND_W = (0.5, 0.25, 0.25)  # (aligned rolling OLS, plain all-launch OLS, Huber rolling OLS)
+SPREAD_MULT = 0.6          # shrinkage applied to empirical residual quantiles
+BLEND_W = (0.6, 0.3, 0.1)  # (aligned rolling OLS, plain all-launch OLS, Huber rolling OLS)
 MIN_POINTS = 5             # minimum training launches to fit one hour
 RECENCY_PER_YEAR = 0.08    # weight grows 8% per year after 2018
 SCALE_WINDOW = 20.0        # plain OLS trains only on launches within 20x of the target's print
+SHRINK_B = 1.0             # slope shrinkage: fitted slope b -> 1 + SHRINK_B*(b-1); 1 keeps OLS
+EXCLUDE_WEAK = False       # drop comparables the source tiers as weak analogues (F2P, slow-burn)
+EXCLUDE_WEAK_A = True     # drop weak-tier launches from the aligned component only
+EXCLUDE_UNVER_A = False    # drop unverified-unlock launches from the aligned component only
+RATIO_W = 0.0              # weight of a 4th component: median log-ratio per hour (rolling set)
+KERNEL_W = 0.15            # weight of a kernel (nearest-neighbour) component (rolling set)
+KERNEL_BW = 1.5            # Gaussian bandwidth of the kernel, in log-viewer units
+KLL_W = 0.0                # weight of a local-linear kernel OLS component (rolling set)
+CONSOLE_BONUS = 1.0        # extra weight for console-only launches (no PC in platforms)
 
 
 def parse_ts(text):
@@ -114,6 +123,12 @@ def day_series(comparable):
     return [by_hour.get(h) for h in range(1, 25)]
 
 
+def is_weak(comparable):
+    """The source tiers some launches as weak analogues (free-to-play,
+    slow-burn, live-service): their curves follow a different regime."""
+    return "tier: weak" in (comparable.get("unlock", "") or "").lower()
+
+
 def build_curves(case):
     """Usable comparable launches, each with its release-day curve and weight."""
     own_name = (case.get("game") or {}).get("name", "")
@@ -122,6 +137,8 @@ def build_curves(case):
         name = comp.get("name", "")
         if name.startswith("Grand Theft Auto VI") or name == own_name:
             continue  # the GTA VI category's own pre-release history is no launch
+        if EXCLUDE_WEAK and is_weak(comp):
+            continue
         series = day_series(comp)
         if not series[0] or sum(1 for v in series if v) < 20:
             continue
@@ -130,14 +147,20 @@ def build_curves(case):
             continue
         peak_hour = series.index(peak) + 1
         year = parse_ts(comp["day_start"]).year
+        weight = 1.0 + RECENCY_PER_YEAR * (year - 2018)
+        if CONSOLE_BONUS != 1.0 and "PC" not in (comp.get("platforms") or ""):
+            weight *= CONSOLE_BONUS
         curves.append({
             "name": name,
             "series": series,
-            "weight": 1.0 + RECENCY_PER_YEAR * (year - 2018),
+            "weight": weight,
             "day_start": comp["day_start"],
             "p1_over_peak": series[0] / peak,
             "peak_hour": peak_hour,
             "early": is_early_access(comp.get("unlock", "")),
+            "tier": comp.get("tier", ""),
+            "weak": is_weak(comp),
+            "unlock": comp.get("unlock", ""),
         })
     return curves
 
@@ -174,6 +197,9 @@ def wls(points):
 def fit_hour(points, log_p1):
     """OLS fit for one hour. Returns (median log viewers, sorted residuals)."""
     intercept, slope = wls(points)
+    slope = 1.0 + SHRINK_B * (slope - 1.0)
+    intercept = (sum(w * y for _, y, w in points)
+                 - slope * sum(w * x for x, _, w in points)) / sum(w for _, _, w in points)
     residuals = sorted(y - (intercept + slope * x) for x, y, _ in points)
     return intercept + slope * log_p1, residuals
 
@@ -184,8 +210,14 @@ def quantiles_from_residuals(median_log, residuals):
 
 
 def component_aligned(curves, log_p1, target_step):
-    """Per-offset OLS on rolling launches, aligned by the US-East unlock hour."""
+    """Per-offset OLS on rolling launches, aligned by the US-East unlock hour.
+    When EXCLUDE_WEAK_A / EXCLUDE_UNVER_A are set, weak-tier or
+    unverified-unlock launches are left out of this component only."""
     rolling = [c for c in curves if is_rolling(c)]
+    if EXCLUDE_WEAK_A:
+        rolling = [c for c in rolling if not c.get("weak")]
+    if EXCLUDE_UNVER_A:
+        rolling = [c for c in rolling if "unverified" not in (c.get("unlock") or "").lower()]
     out = {}
     for offset in range(-4, 20):
         points = []
@@ -224,6 +256,87 @@ def component_plain(curves, log_p1):
     return out
 
 
+def wquantile(pairs, tau):
+    """Weighted quantile of (value, weight) pairs, linear interpolation."""
+    ordered = sorted(pairs)
+    total = sum(w for _, w in ordered)
+    if total <= 0:
+        return float("nan")
+    target = tau * total
+    acc = 0.0
+    for i, (value, w) in enumerate(ordered):
+        prev = acc
+        acc += w
+        if acc >= target:
+            if i == 0 or acc == prev:
+                return value
+            frac = (target - prev) / (acc - prev)
+            return ordered[i - 1][0] * (1.0 - frac) + value * frac
+    return ordered[-1][0]
+
+
+def component_kernel(curves, log_p1):
+    """Nearest-neighbour curve forecast: per hour, a Gaussian kernel over
+    log hour-1 prints weights the rolling launches, and the forecast
+    quantiles are the kernel-weighted quantiles of their log viewers.
+    Local in scale, so a huge target borrows only from the biggest launches
+    and the shape can saturate instead of following one global line."""
+    rolling = [c for c in curves if is_rolling(c)]
+    out = {}
+    for hour in range(2, 25):
+        pairs = []
+        for c in rolling:
+            if c["series"][hour - 1] and c["series"][0]:
+                x = math.log(max(1.0, c["series"][0]))
+                kw = math.exp(-0.5 * ((x - log_p1) / KERNEL_BW) ** 2)
+                pairs.append((math.log(max(1.0, c["series"][hour - 1])),
+                              kw * c["weight"]))
+        if len(pairs) < MIN_POINTS or sum(w for _, w in pairs) <= 0:
+            continue
+        centre = wquantile(pairs, 0.5)
+        out[hour] = [math.exp(centre + (wquantile(pairs, tau) - centre) * SPREAD_MULT)
+                     for tau in LEVELS]
+    return out
+
+
+def component_kernel_ll(curves, log_p1):
+    """Local-linear kernel OLS: per hour, a Gaussian kernel over log hour-1
+    prints weights the rolling launches and an OLS line is fitted through
+    them. Local like the kernel, parametric like the OLS components."""
+    rolling = [c for c in curves if is_rolling(c)]
+    out = {}
+    for hour in range(2, 25):
+        points = []
+        for c in rolling:
+            if c["series"][hour - 1] and c["series"][0]:
+                x = math.log(max(1.0, c["series"][0]))
+                kw = math.exp(-0.5 * ((x - log_p1) / KERNEL_BW) ** 2)
+                points.append((x, math.log(max(1.0, c["series"][hour - 1])),
+                               kw * c["weight"]))
+        if len(points) < MIN_POINTS or sum(w for _, _, w in points) <= 0:
+            continue
+        median_log, residuals = fit_hour(points, log_p1)
+        out[hour] = quantiles_from_residuals(median_log, residuals)
+    return out
+
+
+def component_ratio(curves, log_p1):
+    """Median log-ratio per hour on rolling launches: the evening/morning
+    growth ratio's own distribution, no regression on the hour-1 print."""
+    rolling = [c for c in curves if is_rolling(c)]
+    out = {}
+    for hour in range(2, 25):
+        ratios = sorted(math.log(max(1.0, c["series"][hour - 1]))
+                        - math.log(max(1.0, c["series"][0]))
+                        for c in rolling
+                        if c["series"][hour - 1] and c["series"][0])
+        if len(ratios) < MIN_POINTS:
+            continue
+        out[hour] = [math.exp(log_p1 + quantile(ratios, tau) * SPREAD_MULT)
+                     for tau in LEVELS]
+    return out
+
+
 def component_huber(curves, log_p1):
     """Per-hour Huber-robust OLS on rolling launches (down-weights outliers)."""
     rolling = [c for c in curves if is_rolling(c)]
@@ -246,6 +359,9 @@ def component_huber(curves, log_p1):
             k = 1.345
             weights = [w * (1.0 if abs(r) <= k * scale else k * scale / abs(r))
                        for (_, _, w), r in zip(points, residuals)]
+        slope = 1.0 + SHRINK_B * (slope - 1.0)
+        intercept = (sum(w * y for (_, y, _), w in zip(points, weights))
+                     - slope * sum(w * x for (x, _, _), w in zip(points, weights))) / sum(weights)
         residuals = sorted(y - (intercept + slope * x) for x, y, _ in points)
         median_log = intercept + slope * log_p1
         out[hour] = quantiles_from_residuals(median_log, residuals)
@@ -290,10 +406,20 @@ def forecast_case(case):
         component_plain(curves, log_p1),
         component_huber(curves, log_p1),
     ]
+    weights = list(BLEND_W)
+    if RATIO_W > 0:
+        components.append(component_ratio(curves, log_p1))
+        weights.append(RATIO_W)
+    if KERNEL_W > 0:
+        components.append(component_kernel(curves, log_p1))
+        weights.append(KERNEL_W)
+    if KLL_W > 0:
+        components.append(component_kernel_ll(curves, log_p1))
+        weights.append(KLL_W)
 
     hours = []
     for hour in range(2, 25):
-        available = [(w, comp[hour]) for w, comp in zip(BLEND_W, components)
+        available = [(w, comp[hour]) for w, comp in zip(weights, components)
                      if hour in comp]
         if not available:
             hours.append({"hour": hour, "q": baseline_quantiles(p1, hour)})
